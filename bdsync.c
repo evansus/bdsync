@@ -65,6 +65,9 @@
 #include <errno.h>
 #include <poll.h>
 
+// FreeBSD
+#include "bdsync_freebsd.h"
+
 #define RDAHEAD (1024*1024)
 
 /* max total queuing write data */
@@ -1313,7 +1316,7 @@ int gen_hashes ( const EVP_MD *md
                , off64_t start, off64_t step, int nstep)
 {
     unsigned char *buf, *fbuf;
-    off64_t       nrd, lenend;
+    off64_t       nrd, lenend = 0;
     int           hashsize = EVP_MD_size (md);
     EVP_MD_CTX    *dg_ctx;
 
@@ -1365,7 +1368,11 @@ int opendev (char *dev, off64_t *siz, int flags)
 {
     int     fd;
 
+#ifndef __FREEBSD__
     fd = open (dev, flags | O_LARGEFILE);
+#else
+    fd = open (dev, flags | O_DIRECT);
+#endif
     if (fd == -1) {
         verbose (0, "opendev [%s]: %s\n", dev, strerror (errno));
         exit (1);
@@ -1854,7 +1861,7 @@ int do_patch (char *dev, int diffsize)
 
     for (;;) {
         off64_t        pos;
-        unsigned short blen;
+        unsigned short blen = 0U;
 
         if (   fread (&pos,  1, sizeof (pos),  stdin) != sizeof (pos)
             || fread (&blen, 1, sizeof (blen), stdin) != sizeof (blen)
