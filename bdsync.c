@@ -65,6 +65,10 @@
 #include <errno.h>
 #include <poll.h>
 
+#ifdef __APPLE__
+#include "bdsync_osx.h"
+#endif
+
 #define RDAHEAD (1024*1024)
 
 /* max total queuing write data */
@@ -1365,7 +1369,11 @@ int opendev (char *dev, off64_t *siz, int flags)
 {
     int     fd;
 
+#ifndef __APPLE__
     fd = open (dev, flags | O_LARGEFILE);
+#else
+    fd = open (dev, flags | O_DIRECT);
+#endif
     if (fd == -1) {
         verbose (0, "opendev [%s]: %s\n", dev, strerror (errno));
         exit (1);
