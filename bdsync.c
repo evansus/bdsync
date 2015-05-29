@@ -47,6 +47,7 @@
 //
 
 #define _LARGEFILE64_SOURCE
+#define _FILE_OFFSET_BITS 64
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -57,7 +58,7 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <string.h>
-#include <openssl/evp.h>
+#include "bdsync-hash.h"
 #include <netdb.h>
 #include <sys/socket.h>
 #include <stdarg.h>
@@ -82,6 +83,17 @@
 
 #define ARCHVER "BDSYNC 0.3"
 #define PROTOVER "0.5"
+
+enum diffsize {
+    ds_none   = 0
+,   ds_strict = 1
+,   ds_resize
+,   ds_minsize
+,   ds_mask   = 0x7f
+,   ds_warn   = 0x80
+};
+
+extern int checkzero (void *p, int len);
 
 void set_blocking(int fd)
 {
@@ -185,30 +197,98 @@ void verbose (int level, char * format, ...)
     va_end (args);
 };
 
-struct cs_state {
-    char       *name;
-    off64_t    nxtpos;
-    EVP_MD_CTX *ctx;
-    int        hashsize;
+void exitmsg (char * format, ...)
+{
+    va_list args;
+
+    va_start (args, format);
+    vhandler (format, args);
+    va_end (args);
+
+    exit (1);
 };
+
+struct zero_hash {
+    char             *name;
+    off_t            blocksize;
+    int              hashsize;
+    unsigned char    *hash;
+    struct zero_hash *pnxt;
+};
+
+struct cs_state {
+    char     *name;
+    off_t    nxtpos;
+    hash_ctx ctx;
+    int      hashsize;
+};
+
+hash_ctx _init_cs (const char *checksum, int *hs)
+{
+    hash_alg md;
+    hash_ctx ctx;
+
+    md  = hash_getbyname (checksum);
+
+    if (!md) {
+        verbose (0, "Bad checksum %s\n", checksum);
+        exit (1);
+    }
+
+    *hs = hash_getsize (md);
+    hash_init (ctx, md);
+
+    return ctx;
+}
+
+static struct zero_hash *pzeroes      = NULL;
+static off_t            zeroblocksize = 0;
+static unsigned char    *zeroblock    = NULL; 
+
+static struct zero_hash *find_zero_hash (const char *name, off_t blocksize, int saltsize, unsigned char *salt)
+{
+    struct zero_hash *pzh = pzeroes;
+    hash_ctx         ctx;
+    int              hs;
+
+    verbose (3, "find_zero_hash: name=%s: blocksize=%lld, salt=%p\n", name, blocksize, salt);
+
+    while (pzh) {
+        if (!strcmp (pzh->name, name) && pzh->blocksize == blocksize) return pzh;
+        pzh = pzh->pnxt;
+    }
+    if (blocksize > zeroblocksize) {
+        if (zeroblock) free (zeroblock);
+        zeroblock = calloc (1, blocksize);
+        zeroblocksize = blocksize;
+    }
+    ctx = _init_cs (name, &hs);
+
+    pzh     = pzeroes;
+    pzeroes = malloc (sizeof (struct zero_hash));
+
+    pzeroes->pnxt      = pzh;
+    pzeroes->name      = strdup (name);
+    pzeroes->blocksize = blocksize;
+    pzeroes->hashsize  = hs;
+    pzeroes->hash      = malloc (hs);
+
+    hash_update (ctx, salt,      saltsize);
+    hash_update (ctx, zeroblock, blocksize);
+    hash_finish (ctx, pzeroes->hash);
+
+    return pzeroes;
+}
 
 struct cs_state *init_checksum (const char *checksum)
 {
-    const EVP_MD    *md;
-    EVP_MD_CTX      *ctx;
+    hash_ctx        ctx;
     int             hs;
     struct cs_state *state;
 
     verbose (2, "init_checksum: checksum: %s\n", checksum);
 
-    md  = EVP_get_digestbyname (checksum);
-    hs  = EVP_MD_size (md);
-    ctx = EVP_MD_CTX_create();
-    EVP_DigestInit_ex (ctx, md, NULL);
-    if (!md) {
-        verbose (0, "Bad checksum %s\n", checksum);
-        exit (1);
-    }
+    ctx = _init_cs (checksum, &hs);
 
     state = malloc (sizeof (*state));
 
@@ -220,32 +300,36 @@ struct cs_state *init_checksum (const char *checksum)
     return state;
 }
 
-int vpread (int devfd, void *buf, off64_t len, off64_t pos, off64_t devsize)
+int vpread (int devfd, void *buf, off_t len, off_t pos, off_t devsize)
 {
-    off64_t rlen = len;
-    int ret      = 0;
-    char *cbuf   = (char *)buf;
+    off_t rlen = len;
+    int ret    = 0;
+    char *cbuf = (char *)buf;
 
     if (pos + rlen > devsize) {
         rlen = devsize - pos;
 
         if (rlen < 0) rlen = 0;
     }
-    if (rlen) ret = pread64 (devfd, cbuf, rlen, pos);
+    if (rlen) {
+        ret = pread (devfd, cbuf, rlen, pos);
+        if (ret < 0) exitmsg ("vpread: %s\n", strerror (errno));
+    }
+
     if (rlen < len) memset (cbuf + rlen, 0, len - rlen);
 
     return ret;
 }
 
-int update_checksum (struct cs_state *state, off64_t pos, int fd, off64_t len, unsigned char *buf, off64_t devsize)
+int update_checksum (struct cs_state *state, off_t pos, int fd, off_t len, unsigned char *buf, off_t devsize)
 {
     if (!state) return 0;
 
     if (pos > state->nxtpos) {
-        size_t  nrd ;
-        off64_t len   = pos - state->nxtpos;
-        size_t  blen  = (len > 32768 ? 32768 : len);
-        char    *fbuf = malloc (blen);
+        size_t nrd ;
+        off_t  len   = pos - state->nxtpos;
+        size_t blen  = (len > 32768 ? 32768 : len);
+        char   *fbuf = malloc (blen);
 
         while (len) {
             verbose (3, "update_checksum: checksum: pos=%lld, len=%d\n"
@@ -254,12 +338,11 @@ int update_checksum (struct cs_state *state, off64_t pos, int fd, off64_t len, u
             nrd = vpread (fd, fbuf, blen, state->nxtpos, devsize);
 
             if (nrd != blen) {
-                verbose (0, "update_checksum: nrd (%lld) != blen (%d)\n"
-                          , (long long)nrd, (int)blen);
-                exit (1);
+                exitmsg ("update_checksum: nrd (%lld) != blen (%d)\n"
+                        , (long long)nrd, (int)blen);
             }
 
-            EVP_DigestUpdate (state->ctx, fbuf, blen);
+            hash_update (state->ctx, fbuf, blen);
 
             state->nxtpos += blen;
             len           -= blen;
@@ -278,7 +361,7 @@ int update_checksum (struct cs_state *state, off64_t pos, int fd, off64_t len, u
     verbose (3, "update_checksum: checksum: pos=%lld, len=%d\n"
             , (long long) state->nxtpos, len);
 
-    EVP_DigestUpdate (state->ctx, buf, len);
+    hash_update (state->ctx, buf, len);
 
     state->nxtpos += len;
 
@@ -303,7 +386,9 @@ int init_salt (int saltsize, unsigned char *salt, int fixedsalt)
     } else {
         int fd = open("/dev/urandom", O_RDONLY);
 
-        read (fd, salt, saltsize);
+        if (read (fd, salt, saltsize) != saltsize) {
+            exitmsg ("piped_child: %s\n", strerror (errno));
+        }
 
         close(fd);
     }
@@ -312,52 +397,47 @@ int init_salt (int saltsize, unsigned char *salt, int fixedsalt)
 
 pid_t piped_child(char **command, int *f_in, int *f_out)
 {
-        pid_t pid;
-        int   to_child_pipe[2];
-        int   from_child_pipe[2];
+    pid_t pid;
+    int   to_child_pipe[2];
+    int   from_child_pipe[2];
 
-        verbose (2, "opening connection using: %s\n", command[0]);
+    verbose (2, "opening connection using: %s\n", command[0]);
 
-        if (fd_pair(to_child_pipe) < 0 || fd_pair(from_child_pipe) < 0) {
-                verbose (0, "piped_child: %s\n", strerror (errno));
-                exit (1);
+    if (fd_pair(to_child_pipe) < 0 || fd_pair(from_child_pipe) < 0) {
+            exitmsg ("piped_child: %s\n", strerror (errno));
+    }
+
+    pid = fork();
+    if (pid == -1) {
+            exitmsg ("piped_child: fork: %s\n", strerror (errno));
+    }
+
+    if (pid == 0) {
+        if (dup2(to_child_pipe[0], STDIN_FILENO) < 0 ||
+            close(to_child_pipe[1]) < 0 ||
+            close(from_child_pipe[0]) < 0 ||
+            dup2(from_child_pipe[1], STDOUT_FILENO) < 0) {
+            exitmsg ("piped_child: dup2: %s\n", strerror (errno));
         }
+        if (to_child_pipe[0] != STDIN_FILENO)
+                close(to_child_pipe[0]);
+        if (from_child_pipe[1] != STDOUT_FILENO)
+                close(from_child_pipe[1]);
+            // umask(orig_umask);
+        set_blocking(STDIN_FILENO);
+        set_blocking(STDOUT_FILENO);
+        execvp(command[0], command);
+        exitmsg ("piped_child: execvp: %s\n", strerror (errno));
+    }
 
-        pid = fork();
-        if (pid == -1) {
-                verbose (0, "piped_child: fork: %s\n", strerror (errno));
-                exit (1);
-        }
+    if (close(from_child_pipe[1]) < 0 || close(to_child_pipe[0]) < 0) {
+        exitmsg ("piped_child: close: %s\n", strerror (errno));
+    }
 
-        if (pid == 0) {
-                if (dup2(to_child_pipe[0], STDIN_FILENO) < 0 ||
-                    close(to_child_pipe[1]) < 0 ||
-                    close(from_child_pipe[0]) < 0 ||
-                    dup2(from_child_pipe[1], STDOUT_FILENO) < 0) {
-                        verbose (0, "piped_child: dup2: %s\n", strerror (errno));
-                        exit (1);
-                }
-                if (to_child_pipe[0] != STDIN_FILENO)
-                        close(to_child_pipe[0]);
-                if (from_child_pipe[1] != STDOUT_FILENO)
-                        close(from_child_pipe[1]);
-                // umask(orig_umask);
-                set_blocking(STDIN_FILENO);
-                set_blocking(STDOUT_FILENO);
-                execvp(command[0], command);
-                verbose (0, "piped_child: execvp: %s\n", strerror (errno));
-                exit (1);
-        }
+    *f_in = from_child_pipe[0];
+    *f_out = to_child_pipe[1];
 
-        if (close(from_child_pipe[1]) < 0 || close(to_child_pipe[0]) < 0) {
-                verbose (0, "piped_child: close: %s\n", strerror (errno));
-                exit (1);
-        }
-
-        *f_in = from_child_pipe[0];
-        *f_out = to_child_pipe[1];
-
-        return pid;
+    return pid;
 };
 
 pid_t do_command (char *command, struct rd_queue *prd_queue, struct wr_queue *pwr_queue)
@@ -374,16 +454,14 @@ pid_t do_command (char *command, struct rd_queue *prd_queue, struct wr_queue *pw
         if (*f == ' ') continue;
         /* Comparison leaves rooms for server_options(). */
         if (argc >= ARGMAX - 1) {
-            verbose (0, "internal: args[] overflowed in do_command()\n");
-            exit (1);
+            exitmsg ("internal: args[] overflowed in do_command()\n");
         }
         args[argc++] = t;
         while (*f != ' ' || in_quote) {
             if (!*f) {
                 if (in_quote) {
-                    verbose (0, "Missing trailing-%c in remote-shell command.\n"
+                    exitmsg ("Missing trailing-%c in remote-shell command.\n"
                             , in_quote);
-                    exit (1);
                 }
                 f--;
                 break;
@@ -414,7 +492,7 @@ pid_t do_command (char *command, struct rd_queue *prd_queue, struct wr_queue *pw
     return pid;
 };
 
-char *int2char (char *buf, off64_t val, int bytes)
+char *int2char (char *buf, off_t val, int bytes)
 {
     char *p;
 
@@ -425,9 +503,9 @@ char *int2char (char *buf, off64_t val, int bytes)
     return buf;
 }
 
-off64_t char2int (char *buf, int bytes)
+off_t char2int (char *buf, int bytes)
 {
-    off64_t       ret = 0;
+    off_t         ret = 0;
     unsigned char *p = (unsigned char *)buf + bytes;
 
     for (; bytes; bytes--) {
@@ -769,7 +847,7 @@ int send_devfile (struct wr_queue *pqueue, char *devfile)
     return send_msgstring (pqueue, msg_devfile, devfile);
 }
 
-int send_size (struct wr_queue *pqueue, off64_t devsize)
+int send_size (struct wr_queue *pqueue, off_t devsize)
 {
     char tbuf[sizeof (devsize)];
 
@@ -797,7 +875,6 @@ char *bytes2str (size_t s, unsigned char *p)
 
 int send_digests (struct wr_queue *pqueue, int saltsize, unsigned char *salt, char *digest, char *checksum)
 {
-    char       *tmp = bytes2str (saltsize, salt);
     char       *cp, *buf;
     const char *tchecksum;
     size_t     buflen;
@@ -813,10 +890,12 @@ int send_digests (struct wr_queue *pqueue, int saltsize, unsigned char *salt, ch
         exit (1);
     }
 
-    verbose (1, "send_digests: salt = %s, digest = %s, checksum = %s\n"
-              , tmp, digest, (checksum ? checksum : "(none)"));
-
-    free (tmp);
+    if (isverbose >= 1) {
+        char *tmp = bytes2str (saltsize, salt);
+        verbose (1, "send_digests: salt = %s, digest = %s, checksum = %s\n"
+                  , tmp, digest, (checksum ? checksum : "(none)"));
+        free (tmp);
+    }
 
     tchecksum = (checksum ? checksum : "");
 
@@ -840,12 +919,12 @@ int send_digests (struct wr_queue *pqueue, int saltsize, unsigned char *salt, ch
     return ret;
 }
 
-int send_gethashes (struct wr_queue *pqueue, off64_t start, off64_t step, int nstep)
+int send_gethashes (struct wr_queue *pqueue, off_t start, off_t step, int nstep)
 {
-    off64_t par[3];
-    char    tbuf[sizeof (par)];
-    char    *cp;
-    int     i;
+    off_t par[3];
+    char  tbuf[sizeof (par)];
+    char  *cp;
+    int   i;
 
     par[0] = start;
     par[1] = step;
@@ -860,11 +939,11 @@ int send_gethashes (struct wr_queue *pqueue, off64_t start, off64_t step, int ns
     return add_wr_queue (pqueue, msg_gethashes, tbuf, sizeof (par));
 };
 
-int send_hashes (struct wr_queue *pqueue, off64_t start, off64_t step, int nstep, unsigned char *buf, size_t siz)
+int send_hashes (struct wr_queue *pqueue, off_t start, off_t step, int nstep, unsigned char *buf, size_t siz)
 {
-    off64_t par[3];
-    char    *tbuf, *cp;
-    int     ret, i;
+    off_t par[3];
+    char  *tbuf, *cp;
+    int   ret, i;
 
     par[0] = start;
     par[1] = step;
@@ -887,12 +966,12 @@ int send_hashes (struct wr_queue *pqueue, off64_t start, off64_t step, int nstep
     return ret;
 };
 
-int send_getblock (struct wr_queue *pqueue, off64_t pos, off64_t len)
+int send_getblock (struct wr_queue *pqueue, off_t pos, off_t len)
 {
-    off64_t par[2];
-    char    tbuf[sizeof (par)];
-    char    *cp;
-    int     i;
+    off_t par[2];
+    char  tbuf[sizeof (par)];
+    char  *cp;
+    int   i;
 
     par[0] = pos;
     par[1] = len;
@@ -906,7 +985,7 @@ int send_getblock (struct wr_queue *pqueue, off64_t pos, off64_t len)
     return add_wr_queue (pqueue, msg_getblock, tbuf, sizeof (par));
 };
 
-int send_block (struct wr_queue *pqueue, int fd, off64_t pos, off64_t len)
+int send_block (struct wr_queue *pqueue, int fd, off_t pos, off_t len)
 {
     char *tbuf, *cp;
     int  ret;
@@ -919,7 +998,14 @@ int send_block (struct wr_queue *pqueue, int fd, off64_t pos, off64_t len)
     int2char (cp, pos, sizeof (pos));
     cp += sizeof (pos);
 
-    pread (fd, cp, len, pos);
+    ret = pread (fd, cp, len, pos);
+    if (ret != len) {
+        if (len < 0) {
+            exitmsg ("send_block: pread: %s\n", strerror (errno));
+        } else {
+            exitmsg ("send_block: pread read bad #bytes");
+        }
+    }
 
     ret = add_wr_queue (pqueue, msg_block, tbuf, sizeof (pos) + len);
 
@@ -937,11 +1023,11 @@ int send_getchecksum (struct wr_queue *pqueue)
 
 int send_checksum (struct wr_queue *pqueue, int len, unsigned char *buf)
 {
-    char *tmp = bytes2str (len, buf);
-
-    verbose (1, "send_checksum: checksum=%s\n", tmp);
-
-    free (tmp);
+    if (isverbose >= 1) {
+        char *tmp = bytes2str (len, buf);
+        verbose (1, "send_checksum: checksum=%s\n", tmp);
+        free (tmp);
+    }
 
     return add_wr_queue (pqueue, msg_checksum, (char *)buf, len);
 };
@@ -1062,7 +1148,7 @@ int parse_hello (char *msgbuf, size_t msglen, char **hello)
     return ret;
 };
 
-int parse_size (char *msgbuf, size_t msglen, off64_t *size)
+int parse_size (char *msgbuf, size_t msglen, off_t *size)
 {
     if (msglen != sizeof (*size)) exit (1);
 
@@ -1090,9 +1176,8 @@ const char *get_string (char **msgbuf, size_t *msglen)
     return ret;
 };
 
-int parse_digests (char *msgbuf, size_t msglen, int *saltsize, unsigned char **salt, const EVP_MD **dg_md, struct cs_state **cs_state)
+int parse_digests (char *msgbuf, size_t msglen, int *saltsize, unsigned char **salt, char **dg_nm, hash_alg *dg_md, struct cs_state **cs_state)
 {
-    char       *tmp;
     const char *digest, *checksum;
 
     if (msglen < 1) {
@@ -1122,7 +1207,8 @@ int parse_digests (char *msgbuf, size_t msglen, int *saltsize, unsigned char **s
         exit (1);
     }
 
-    *dg_md = EVP_get_digestbyname (digest);
+    *dg_nm = strdup (digest);
+    *dg_md = hash_getbyname (digest);
 
     if (!*dg_md) {
         verbose (0, "parse_digests: bad digest %s\n", digest);
@@ -1131,20 +1217,21 @@ int parse_digests (char *msgbuf, size_t msglen, int *saltsize, unsigned char **s
 
     *cs_state = (*checksum != '\0' ? init_checksum (checksum) : NULL);
 
-    tmp = bytes2str (*saltsize, *salt);
-    verbose (1, "parse_digests: salt = %s, digest = %s checksum = %s\n"
-            , tmp, digest, (*checksum == '\0' ? "(none)" : checksum));
-
-    free (tmp);
+    if (isverbose >= 1) {
+        char *tmp = bytes2str (*saltsize, *salt);
+        verbose (1, "parse_digests: salt = %s, digest = %s checksum = %s\n"
+                , tmp, digest, (*checksum == '\0' ? "(none)" : checksum));
+        free (tmp);
+    }
 
     return 0;
 };
 
 int parse_gethashes ( char *msgbuf, size_t msglen
-                    , off64_t *start, off64_t *step, int *nstep)
+                    , off_t *start, off_t *step, int *nstep)
 {
-    off64_t par[3];
-    int     i;
+    off_t par[3];
+    int   i;
 
     if (msglen != sizeof (par)) {
         verbose (0, "parse_gethashes: bad message size %d\n", (int)msglen);
@@ -1165,10 +1252,10 @@ int parse_gethashes ( char *msgbuf, size_t msglen
 };
 
 int parse_getblock ( char *msgbuf, size_t msglen
-                   , off64_t *pos, off64_t *len)
+                   , off_t *pos, off_t *len)
 {
-    off64_t par[2];
-    int     i;
+    off_t par[2];
+    int   i;
 
     if (msglen != sizeof (par)) {
         verbose (0, "parse_getblock: bad message size %d\n", (int)msglen);
@@ -1188,7 +1275,7 @@ int parse_getblock ( char *msgbuf, size_t msglen
 };
 
 int parse_block ( char *msgbuf, size_t msglen
-                , off64_t *pos, off64_t *len, char **pblock)
+                , off_t *pos, off_t *len, char **pblock)
 {
     /* there should at least 1 byte in the block */
     if (msglen < sizeof (*pos) + 1) {
@@ -1206,10 +1293,10 @@ int parse_block ( char *msgbuf, size_t msglen
 };
 
 int parse_hashes ( int hashsize, char *msgbuf, size_t msglen
-                 , off64_t *start, off64_t *step, int *nstep, unsigned char **hbuf)
+                 , off_t *start, off_t *step, int *nstep, unsigned char **hbuf)
 {
-    off64_t par[3];
-    int     i;
+    off_t par[3];
+    int   i;
 
     if (msglen < sizeof (par)) {
         verbose (0, "parse_hashes: bad size=%lld minimum=%lld\n", (long long)msglen, (long long)(sizeof (par)));
@@ -1287,10 +1374,9 @@ int flush_checksum (struct cs_state **state, size_t *len, unsigned char **buf)
         *len = (*state)->hashsize;
         *buf = malloc (*len);
 
-        EVP_DigestFinal_ex ((*state)->ctx, *buf, NULL);
-        EVP_MD_CTX_destroy ((*state)->ctx);
+        hash_finish ((*state)->ctx, *buf);
 
-        {
+        if (isverbose >= 2) {
             char *tmp = bytes2str (*len, *buf);
             verbose (2, "flush_checksum: [%s]: %s\n", (*state)->name, tmp);
             free (tmp);
@@ -1308,18 +1394,19 @@ int flush_checksum (struct cs_state **state, size_t *len, unsigned char **buf)
     return 0;
 }
 
-int gen_hashes ( const EVP_MD *md
+int gen_hashes ( hash_alg md
+               , struct zero_hash *zh
                , struct cs_state *cs_state
                , struct rd_queue *prd_queue, struct wr_queue *pwr_queue
                , int saltsize, unsigned char *salt
                , unsigned char **retbuf, size_t *retsiz, int fd
-               , off64_t devsize
-               , off64_t start, off64_t step, int nstep)
+               , off_t devsize
+               , off_t start, off_t step, int nstep)
 {
     unsigned char *buf, *fbuf;
-    off64_t       nrd, lenend;
-    int           hashsize = EVP_MD_size (md);
-    EVP_MD_CTX    *dg_ctx;
+    off_t         nrd;
+    int           hashsize = hash_getsize (md);
+    hash_ctx      dg_ctx;
 
     *retsiz = nstep * hashsize;
     buf     = malloc (nstep * hashsize);
@@ -1336,27 +1423,30 @@ int gen_hashes ( const EVP_MD *md
 
         nrd = vpread (fd, fbuf, step, start, devsize);
 
-        verbose (3, "gen_hashes: hash: pos=%lld, len=%d\n"
-                , (long long) start, nrd);
-
 /* Kills performance; really slow syscall:
         posix_fadvise64 (fd, start + step, RDAHEAD, POSIX_FADV_WILLNEED);
 */
+        if (zh && checkzero (fbuf, step)) {
+            memcpy (buf, zh->hash, zh->hashsize);
+        } else {
+            hash_init (dg_ctx, md);
+            hash_update (dg_ctx, salt, saltsize);
+            hash_update (dg_ctx, fbuf, step);
+            hash_finish (dg_ctx, buf);
+        }
 
-        dg_ctx = EVP_MD_CTX_create();
-        EVP_DigestInit_ex (dg_ctx, md, NULL);
-        EVP_DigestUpdate (dg_ctx, salt, saltsize);
-        EVP_DigestUpdate (dg_ctx, fbuf, nrd);
-        EVP_DigestFinal_ex (dg_ctx, buf, NULL);
-        EVP_MD_CTX_destroy (dg_ctx);
-
+        if (isverbose >= 3) {
+            char *tmp = bytes2str (hashsize, buf);
+            verbose (3, "gen_hashes: hash: pos=%lld, len=%d, hash=%s\n"
+                    , (long long) start, nrd, tmp);
+            free (tmp);
+        }
         update_checksum (cs_state, start, fd, step, fbuf, devsize);
 
         buf += hashsize;
 
         nstep--;
         start  += step;
-        lenend -= step;
     }
     *retsiz = buf - *retbuf;
 
@@ -1365,7 +1455,7 @@ int gen_hashes ( const EVP_MD *md
     return 0;
 };
 
-int opendev (char *dev, off64_t *siz, int flags)
+int opendev (char *dev, off_t *siz, int flags)
 {
     int     fd;
 
@@ -1378,27 +1468,29 @@ int opendev (char *dev, off64_t *siz, int flags)
         verbose (0, "opendev [%s]: %s\n", dev, strerror (errno));
         exit (1);
     }
-    *siz = lseek64 (fd, 0, SEEK_END);
+    *siz = lseek (fd, 0, SEEK_END);
 
     verbose (1, "opendev: opened %s\n", dev);
 
     return fd;
 };
 
-int do_server (void)
+int do_server (int zeroblocks)
 {
-    char            *msg;
-    size_t          msglen;
-    unsigned char   token;
-    unsigned char   *buf, *salt;
-    int             devfd, nstep;
-    int             saltsize = 0;
-    off64_t         devsize, start, step;
-    size_t          len;
-    struct          wr_queue wr_queue;
-    struct          rd_queue rd_queue;
-    const EVP_MD    *dg_md = NULL;
-    struct cs_state *cs_state;
+    char             *msg;
+    size_t           msglen;
+    unsigned char    token;
+    unsigned char    *buf, *salt;
+    int              devfd = -1, nstep;
+    int              saltsize = 0;
+    off_t            devsize = 0, start, step;
+    size_t           len;
+    struct           wr_queue wr_queue;
+    struct           rd_queue rd_queue;
+    hash_alg         dg_md = hash_null;
+    struct cs_state  *cs_state;
+    char             *dg_nm;
+    struct zero_hash *zh;
 
     init_wr_queue (&wr_queue, STDOUT_FILENO);
     init_rd_queue (&rd_queue, STDIN_FILENO);
@@ -1433,11 +1525,12 @@ int do_server (void)
             send_size (&wr_queue, devsize);
             break;
         case msg_digests:
-            parse_digests (msg, msglen, &saltsize, &salt, &dg_md, &cs_state);
+            parse_digests (msg, msglen, &saltsize, &salt, &dg_nm, &dg_md, &cs_state);
             break;
         case msg_gethashes:
             parse_gethashes (msg, msglen, &start, &step, &nstep);
-            gen_hashes (dg_md, cs_state, &rd_queue, &wr_queue, saltsize, salt, &buf, &len, devfd, devsize, start, step, nstep);
+            zh = (zeroblocks ? find_zero_hash (dg_nm, step, saltsize, salt) : NULL);
+            gen_hashes (dg_md, zh, cs_state, &rd_queue, &wr_queue, saltsize, salt, &buf, &len, devfd, devsize, start, step, nstep);
             send_hashes (&wr_queue, start, step, nstep, buf, len);
             free (buf);
             break;
@@ -1519,9 +1612,9 @@ void check_token (char *f, unsigned char token, unsigned char expect)
 // #define HSMALL  32768
 // #define HLARGE  32768
 
-#define MAXHASHES(hashsize) ((MSGMAX-3*sizeof(off64_t))/hashsize)
+#define MAXHASHES(hashsize) ((MSGMAX-3*sizeof(off_t))/hashsize)
 
-int write_block (off64_t pos, unsigned short len, char *pblock)
+int write_block (off_t pos, unsigned short len, char *pblock)
 {
     fwrite (&pos, sizeof (pos), 1, stdout);
     fwrite (&len, sizeof (len), 1, stdout);
@@ -1530,17 +1623,19 @@ int write_block (off64_t pos, unsigned short len, char *pblock)
     return 0;
 }
 
-int hashmatch ( const EVP_MD *md
+int hashmatch ( const char *dg_nm
+              , hash_alg dg_md
               , struct cs_state *cs_state
               , int remdata
               , int saltsize, unsigned char *salt
-              , off64_t ldevsize, off64_t rdevsize
+              , off_t ldevsize, off_t rdevsize
               , struct rd_queue *prd_queue, struct wr_queue *pwr_queue, int devfd
-              , off64_t hashstart, off64_t hashend, off64_t hashstep, off64_t nextstep
+              , off_t hashstart, off_t hashend, off_t hashstep, off_t nextstep
               , int maxsteps
               , int *hashreqs
               , int *blockreqs
-              , int recurs)
+              , int recurs
+              , int zeroblocks)
 {
     int           hashsteps;
     unsigned char *rhbuf;
@@ -1549,8 +1644,9 @@ int hashmatch ( const EVP_MD *md
     char          *msg;
     size_t        msglen;
     unsigned char token;
-    off64_t       rstart, rstep, mdevsize;
+    off_t         rstart, rstep, mdevsize;
     int           rnstep, hashsize;
+    struct zero_hash *zh;
 
     verbose (2, "hashmatch: recurs=%d hashstart=%lld hashend=%lld hashstep=%lld maxsteps=%d devsize=%lld vdevsize=%lld\n"
             , recurs, (long long)hashstart, (long long)hashend, (long long)hashstep, maxsteps
@@ -1558,7 +1654,7 @@ int hashmatch ( const EVP_MD *md
 
     mdevsize = (rdevsize > ldevsize ? rdevsize : ldevsize);
 
-    hashsize = EVP_MD_size (md);
+    hashsize = hash_getsize (dg_md);
 
     while (   (hashstart < hashend)
            || ((recurs == 0) && ((*hashreqs != 0) || (*blockreqs != 0)))) {
@@ -1587,8 +1683,8 @@ int hashmatch ( const EVP_MD *md
             check_token ("", token, msg_block);
             (*blockreqs)--;
 
-            char    *pblock;
-            off64_t pos, len;
+            char  *pblock;
+            off_t pos, len;
 
             parse_block (msg, msglen, &pos, &len, &pblock);
             write_block (pos, len, pblock);
@@ -1607,24 +1703,25 @@ int hashmatch ( const EVP_MD *md
 
         free (msg);
 
+        zh = (zeroblocks ? find_zero_hash (dg_nm, rstep, saltsize, salt) : NULL);
         /* Generate our own list of hashes */
-        gen_hashes (md, (rstep == hashstep ? cs_state : NULL)
+        gen_hashes (dg_md, zh, (rstep == hashstep ? cs_state : NULL)
                    , prd_queue, pwr_queue, saltsize, salt, &lhbuf, &lhsize, devfd, ldevsize, rstart, rstep, rnstep);
 
-        off64_t       pos = rstart;
+        off_t         pos = rstart;
         unsigned char *lp = lhbuf, *rp = rhbuf;
         int           ns = rnstep;
 
         while (ns--) {
             if (bcmp (lp, rp, hashsize)) {
-                off64_t tend = pos + rstep;
+                off_t tend = pos + rstep;
 
                 if (tend > mdevsize) tend = mdevsize;
 
                 if (rstep == nextstep) {
                     /* HSMALL? Then write the data */
-                    off64_t        len   = tend - pos;
-                    off64_t        tpos  = pos;
+                    off_t          len   = tend - pos;
+                    off_t          tpos  = pos;
                     unsigned short blen  = (len > 32768 ? 32768 : len);
                     char           *fbuf = malloc (blen);
 
@@ -1636,18 +1733,21 @@ int hashmatch ( const EVP_MD *md
 
                         if (remdata) {
                             /* Get the blocks from the server */
-                            off64_t tlen = rdevsize - pos;
+                            off_t tlen = rdevsize - pos;
                             if (tlen > blen) tlen = blen;
 
-                            send_getblock (pwr_queue, tpos, tlen);
-                            (*blockreqs)++;
+                            if (tlen > 0) {
+                                send_getblock (pwr_queue, tpos, tlen);
+                                (*blockreqs)++;
+                            }
                         } else {
-                            off64_t tlen = ldevsize - pos;
+                            off_t tlen = ldevsize - pos;
                             if (tlen > blen) tlen = blen;
 
-                            vpread (devfd, fbuf, tlen, tpos, ldevsize);
-
-                            write_block (tpos, tlen, fbuf);
+                            if (tlen > 0) {
+                                vpread (devfd, fbuf, tlen, tpos, ldevsize);
+                                write_block (tpos, tlen, fbuf);
+                            }
                         }
                         len  -= blen;
                         tpos += blen;
@@ -1658,7 +1758,7 @@ int hashmatch ( const EVP_MD *md
                     /* Not HSMALL? Then zoom in on the details (HSMALL) */
                     int tnstep = rstep / nextstep;
                     if (tnstep > MAXHASHES (hashsize)) tnstep = MAXHASHES (hashsize);
-                    hashmatch (md, NULL, remdata, saltsize, salt, ldevsize, rdevsize, prd_queue, pwr_queue, devfd, pos, tend, nextstep, nextstep, tnstep, hashreqs, blockreqs, recurs + 1);
+                    hashmatch (dg_nm, dg_md, NULL, remdata, saltsize, salt, ldevsize, rdevsize, prd_queue, pwr_queue, devfd, pos, tend, nextstep, nextstep, tnstep, hashreqs, blockreqs, recurs + 1, zeroblocks);
                 }
             }
             lp  += hashsize;
@@ -1673,22 +1773,22 @@ int hashmatch ( const EVP_MD *md
     return 0;
 };
 
-int do_client (char *digest, char *checksum, char *command, char *ldev, char *rdev, off64_t hlarge, off64_t hsmall, int remdata, int fixedsalt, int diffsize)
+int do_client (char *digest, char *checksum, char *command, char *ldev, char *rdev, off_t hlarge, off_t hsmall, int remdata, int fixedsalt, int diffsize, int zeroblocks)
 {
     char            *msg;
     size_t          msglen;
     unsigned char   token;
     unsigned char   salt[SALTSIZE];
     int             ldevfd;
-    off64_t         ldevsize, rdevsize, mdevsize;
+    off_t           ldevsize, rdevsize, mdevsize;
     unsigned short  devlen;
     struct          wr_queue wr_queue;
     struct          rd_queue rd_queue;
     int             hashsize;
-    const EVP_MD    *dg_md;
+    hash_alg        dg_md;
     struct cs_state *cs_state;
 
-    dg_md = EVP_get_digestbyname (digest);
+    dg_md = hash_getbyname (digest);
     if (!dg_md) {
         fprintf (stderr, "Bad hash %s\n", digest);
         exit (1);
@@ -1700,7 +1800,7 @@ int do_client (char *digest, char *checksum, char *command, char *ldev, char *rd
         cs_state = NULL;
     }
 
-    hashsize = EVP_MD_size (dg_md);
+    hashsize = hash_getsize (dg_md);
 
     init_salt (sizeof (salt), salt, fixedsalt);
 
@@ -1722,10 +1822,26 @@ int do_client (char *digest, char *checksum, char *command, char *ldev, char *rd
     check_token ("", token, msg_size);
     parse_size (msg, msglen, &rdevsize);
     free (msg);
-    if (!diffsize && rdevsize != ldevsize) {
-        verbose (0, "Different sizes local=%lld remote=%lld\n", ldevsize, rdevsize);
-        exit (1);
+    if (rdevsize != ldevsize) {
+        if (diffsize & ds_warn) {
+            verbose (0, "Different sizes local=%lld remote=%lld\n", ldevsize, rdevsize);
+        }
+        switch (diffsize & ds_mask) {
+        case ds_strict:
+            exit (1);
+            break;
+        case ds_minsize:
+            if (rdevsize > ldevsize) {
+                rdevsize = ldevsize;
+            } else {
+                ldevsize = rdevsize;
+            }
+            break;
+        case ds_resize:
+            break;
+        } 
     }
+
     mdevsize = (rdevsize > ldevsize ? rdevsize : ldevsize);
 
     char *tdev = (remdata ? ldev : rdev);
@@ -1740,11 +1856,11 @@ int do_client (char *digest, char *checksum, char *command, char *ldev, char *rd
 
     int hashreqs = 0, blockreqs = 0;
 
-    hashmatch (dg_md, cs_state, remdata, sizeof (salt), salt, ldevsize, rdevsize, &rd_queue, &wr_queue, ldevfd, 0, mdevsize, hlarge, hsmall, MAXHASHES (hashsize), &hashreqs, &blockreqs, 0);
+    hashmatch (digest, dg_md, cs_state, remdata, sizeof (salt), salt, ldevsize, rdevsize, &rd_queue, &wr_queue, ldevfd, 0, mdevsize, hlarge, hsmall, MAXHASHES (hashsize), &hashreqs, &blockreqs, 0, zeroblocks);
 
     // finish the bdsync archive
     {
-        off64_t        pos  = 0;
+        off_t          pos  = 0;
         unsigned short blen = 0;
 
         fwrite (&pos,  sizeof (pos),  1, stdout);
@@ -1798,19 +1914,19 @@ int do_client (char *digest, char *checksum, char *command, char *ldev, char *rd
     return 0;
 };
 
-int do_patch (char *dev, int diffsize)
+int do_patch (char *dev, int warndev, int diffsize)
 {
     int            devfd, len;
-    off64_t        devsize, ndevsize;
+    off_t          devsize, ndevsize;
     int            bufsize = 4096;
     char           *buf = malloc (bufsize);
-    off64_t        lpos;
+    off_t          lpos;
     int            bytct = 0, blkct = 0, segct = 0;
     unsigned short devlen;
     char           *devname;
 
     if (!fgets (buf, bufsize - 1, stdin)) {
-        verbose (0, "do_patch: fgets: %s\n", strerror (errno));
+        verbose (0, "do_patch: EOF(stdin)\n");
         exit (1);
     }
     len = strlen (buf);
@@ -1838,7 +1954,7 @@ int do_patch (char *dev, int diffsize)
     if (dev == NULL) {
         dev = devname;
     } else {
-        if (strcmp (dev, devname)) {
+        if (warndev && strcmp (dev, devname)) {
             verbose (0, "Warning: different device names parameter=%s data=%s\n", dev, devname);
         }
         free (devname);
@@ -1847,28 +1963,35 @@ int do_patch (char *dev, int diffsize)
     devfd = opendev (dev, &devsize, O_RDWR);
 
     if (ndevsize != devsize) {
-        if (diffsize) {
-            if (ftruncate64 (devfd, ndevsize) != 0) {
-                verbose (0, "Cannot truncate device=%s\n", devname);
+        if (diffsize & ds_warn) {
+            verbose (0, "Different sizes current=%lld patch=%lld\n", devsize, ndevsize);
+        }
+        switch (diffsize & ds_mask) {
+        case ds_strict:
+            exit (1);
+            break;
+        case ds_resize:
+            if (ftruncate (devfd, ndevsize) != 0) {
+                verbose (0, "Cannot resize device=%s\n", devname);
                 exit (1);
             }
-        } else {
-            verbose (0, "Sizes don't match device=%lld input=%lld\n", devsize, ndevsize);
-            exit (1);
+            devsize = ndevsize;
+            break;
+        case ds_minsize:
+            break;
         }
     }
 
     lpos = -1;
 
     for (;;) {
-        off64_t        pos;
+        off_t          pos;
         unsigned short blen;
 
         if (   fread (&pos,  1, sizeof (pos),  stdin) != sizeof (pos)
             || fread (&blen, 1, sizeof (blen), stdin) != sizeof (blen)
             || blen < 0 || pos + blen > ndevsize) {
             verbose (0, "Bad data (3)\n");
-            verbose (0, "Bad data (3) %d %d\n", (int)(pos + blen), (int)ndevsize);
             exit (1);
         }
         if (pos == 0 && blen == 0) break;
@@ -1886,12 +2009,21 @@ int do_patch (char *dev, int diffsize)
             verbose (0, "Bad data\n");
             exit (1);
         }
-        verbose (2, "do_patch: write: pos=%lld len=%d\n", (long long)pos, blen);
+        verbose (3, "do_patch: write 1: pos=%lld len=%d\n", (long long)pos, blen);
+
+        lpos = pos + blen;
+
+        if (pos + blen > devsize) {
+            /* optional check for ds_minsize here? */
+            blen = devsize - pos;
+        }
+        if (blen <= 0) continue;
+
+        verbose (2, "do_patch: write 2: pos=%lld len=%d\n", (long long)pos, blen);
         if (pwrite (devfd, buf, blen, pos) != blen) {
             verbose (0, "Write error: pos=%lld len=%d\n", (long long)pos, blen);
             exit (1);
         }
-        lpos = pos + blen;
     }
 
     {
@@ -1921,11 +2053,11 @@ int do_patch (char *dev, int diffsize)
                 verbose (0, "Bad data\n");
                 exit (1);
             }
+
             char *tmp = bytes2str (clen, cval);
-
             verbose (0, "checksum[%s]: %s\n", checksum, tmp);
-
             free (tmp);
+
             free (checksum);
             free (cval);
         }
@@ -1936,41 +2068,94 @@ int do_patch (char *dev, int diffsize)
     return 0;
 };
 
+static int parse_diffsize (int diffsize, char *options)
+{
+    struct ds_map {
+        char *string;
+        int  id;
+    };
+    struct ds_map map[] = {
+        { "strict",  ds_strict  }
+    ,   { "resize",  ds_resize  }
+    ,   { "minsize", ds_minsize }
+    ,   { "warn",    ds_warn    }
+    ,   { NULL,      0          }
+    };
+    struct ds_map *mp;
+
+    char *cp, *np;
+
+    if (diffsize != ds_none) {
+        fprintf (stderr, "double diffsize specification\n");
+        return -1;
+    }
+    if (options == NULL) return ds_resize;
+
+    cp = options;
+
+    while (*cp) {
+        np = strchr (cp, ',');
+        if (!np) {
+            np = strchr (cp, 0);
+        };
+        for (mp = map; mp->string != NULL; mp++) {
+            if (!strncmp (cp, mp->string, np - cp)) break;
+        }
+        if (mp->string == NULL) {
+            fprintf (stderr, "bad diffsize options %s\n", options);
+            return -1;
+        }
+        if (mp->id != ds_warn && (diffsize & ds_mask)) {
+            fprintf (stderr, "contradictive diffsize %d options %s\n", diffsize, options);
+            return -1;
+        }
+        diffsize |= mp->id;
+        cp = (*np == ',' ? np + 1 : np);
+    }
+    if ((diffsize & ds_mask) == ds_none) diffsize |= ds_resize;
+
+    return diffsize;
+};
+
 static struct option long_options[] = {
-      {"server",    no_argument,       0, 's' }
-    , {"patch",     optional_argument, 0, 'p' }
-    , {"verbose",   no_argument,       0, 'v' }
-    , {"blocksize", required_argument, 0, 'b' }
-    , {"hash",      required_argument, 0, 'h' }
-    , {"checksum",  required_argument, 0, 'c' }
-    , {"twopass",   no_argument,       0, 't' }
-    , {"remdata",   no_argument,       0, 'r' }
-    , {"fixedsalt", no_argument,       0, 'f' }
-    , {"diffsize",  no_argument,       0, 'd' }
-    , {0,           0,                 0,  0  }
+      {"server",     no_argument,       0, 's' }
+    , {"patch",      optional_argument, 0, 'p' }
+    , {"verbose",    no_argument,       0, 'v' }
+    , {"blocksize",  required_argument, 0, 'b' }
+    , {"hash",       required_argument, 0, 'h' }
+    , {"checksum",   required_argument, 0, 'c' }
+    , {"twopass",    no_argument,       0, 't' }
+    , {"remdata",    no_argument,       0, 'r' }
+    , {"fixedsalt",  no_argument,       0, 'f' }
+    , {"diffsize",   optional_argument, 0, 'd' }
+    , {"zeroblocks", no_argument,       0, 'z' }
+    , {"warndev",    no_argument,       0, 'w' }
+    , {0,            0,                 0,  0  }
 };
 
 int main (int argc, char *argv[])
 {
-    off64_t blocksize = 4096, hlarge, hsmall;
-    int     isserver  = 0;
-    int     ispatch   = 0;
-    int     twopass   = 0;
-    int     remdata   = 0;
-    int     fixedsalt = 0;
-    int     diffsize  = 0;
-    char    *patchdev = NULL;
-    char    *hash     = NULL;
-    char    *checksum = NULL;
-    char    *cp;
+    off_t blocksize  = 4096, hlarge, hsmall;
+    int   isserver   = 0;
+    int   ispatch    = 0;
+    int   twopass    = 0;
+    int   remdata    = 0;
+    int   fixedsalt  = 0;
+    int   diffsize   = ds_none;
+    int   zeroblocks = 0;
+    int   warndev    = 0;
+    char  *patchdev  = NULL;
+    char  *hash      = NULL;
+    char  *checksum  = NULL;
+    char  *cp;
 
-    OpenSSL_add_all_digests ();
+    hash_global_init ();
 
     for (;;) {
         int option_index = 0;
         int c;
 
-        c = getopt_long ( argc, argv, "sp::vb:h:c:trfd"
+        c = getopt_long ( argc, argv, "sp::vb:h:c:trfd::zw"
                         , long_options, &option_index);
 
         if (c == -1) break;
@@ -2009,7 +2194,14 @@ int main (int argc, char *argv[])
             fixedsalt = 1;
             break;
         case 'd':
-            diffsize = 1;
+            diffsize = parse_diffsize (diffsize, optarg);
+            if (diffsize == -1) return 1;
+            break;
+        case 'z':
+            zeroblocks = 1;
+            break;
+        case 'w':
+            warndev = 1;
             break;
         case '?':
             return 1;
@@ -2017,11 +2209,29 @@ int main (int argc, char *argv[])
     }
     vhandler = verbose_printf;
 
+    switch (diffsize & ds_mask) {
+    case ds_none:
+        diffsize |= ds_strict;
+    case ds_strict:
+        diffsize |= ds_warn;
+        break;
+    }
+
     hsmall = blocksize;
     hlarge = (twopass ? 64 * hsmall : hsmall);
 
     if (checksum && (strlen (checksum) > 127)) {
         verbose (0, "paramater too long for option --checksum\n");
+        exit (1);
+    }
+
+    if (warndev && !ispatch) {
+        fprintf (stderr, "Options --warndev only valide with --patch\n");
+        exit (1);
+    }
+
+    if (zeroblocks && ispatch) {
+        fprintf (stderr, "Contradictive options --zeroblocks and --patch\n");
         exit (1);
     }
 
@@ -2046,7 +2256,7 @@ int main (int argc, char *argv[])
             verbose (0, "Bad number of arguments %d\n", argc - optind);
             return 1;
         }
-        return do_patch (patchdev, diffsize);
+        return do_patch (patchdev, warndev, diffsize);
     }
 
     if (isserver) {
@@ -2055,7 +2265,7 @@ int main (int argc, char *argv[])
             verbose (0, "Bad number of arguments %d\n", argc - optind);
             return 1;
         }
-        return do_server ();
+        return do_server (zeroblocks);
     }
 
     // client
@@ -2066,5 +2276,5 @@ int main (int argc, char *argv[])
 
     if (!hash) hash = "md5";
 
-    return do_client (hash, checksum, argv[optind], argv[optind + 1],argv[optind + 2], hlarge, hsmall, remdata, fixedsalt, diffsize);
+    return do_client (hash, checksum, argv[optind], argv[optind + 1],argv[optind + 2], hlarge, hsmall, remdata, fixedsalt, diffsize, zeroblocks);
 }
