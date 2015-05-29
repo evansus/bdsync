@@ -67,7 +67,8 @@
 #include <poll.h>
 
 #ifdef __APPLE__
-#include "bdsync_osx.h"
+#include <sys/ioctl.h>
+#include <sys/disk.h>
 #endif
 
 #define RDAHEAD (1024*1024)
@@ -1462,13 +1463,35 @@ int opendev (char *dev, off_t *siz, int flags)
 #ifndef __APPLE__
     fd = open (dev, flags | O_LARGEFILE);
 #else
-    fd = open (dev, flags | O_DIRECT);
+    fd = open (dev, flags);
 #endif
+
     if (fd == -1) {
         verbose (0, "opendev [%s]: %s\n", dev, strerror (errno));
         exit (1);
     }
+
+#ifndef __APPLE__
     *siz = lseek (fd, 0, SEEK_END);
+#else
+    uint32_t blksize = 0;
+    uint64_t blkcount = 0;
+    struct stat devstat;
+
+    if (fstat(fd, &devstat) != 0) {
+	verbose(0, "fstat failed [%s]\n", dev);
+	exit (1);
+    }
+
+    if (S_ISBLK(devstat.st_mode) || S_ISCHR(devstat.st_mode)) {
+	    ioctl(fd, DKIOCGETBLOCKSIZE, &blksize);
+	    ioctl(fd, DKIOCGETBLOCKCOUNT, &blkcount);
+	    *siz = blksize * blkcount;
+    } else {
+	    *siz = lseek (fd, 0, SEEK_END);
+    }
+    verbose (1, "size [%s]: %llu\n", dev, *siz);
+#endif
 
     verbose (1, "opendev: opened %s\n", dev);
 
